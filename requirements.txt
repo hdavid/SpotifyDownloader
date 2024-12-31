@@ -1,0 +1,8 @@
+PyQt6
+PyQt6-Qt6
+requests==2.31.0
+Unidecode==1.3.7
+eyed3==0.9.7
+pyinstaller
+asyncio
+zendriver
