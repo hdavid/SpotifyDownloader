@@ -7,7 +7,7 @@ Download songs, playlists and albums from spotify using Spotifydown API.
 
 Largely based on code from:
 
-- https://github.com/surenjanath)
+- https://github.com/surenjanath
 - https://github.com/MattJaccino/spotify-downloader 
 - https://github.com/afkarxyz/SpotifyDown-GUI
 
