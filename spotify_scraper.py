@@ -161,6 +161,9 @@ class SpotifyScraperThread(QThread):
           
     def run(self):
         try:
+            #reset progress bar
+            self.counts.emit(100, 0, 0, 0)
+            
             if self.is_playlist(self.link) or self.is_album(self.link):
                 entity_id = self.link.split('/')[-1].split('?')[0]
                 entity_metadata_resp = self._call_downloader_api(f"/metadata/playlist/{entity_id}")
