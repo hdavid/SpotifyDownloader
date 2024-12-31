@@ -21,7 +21,7 @@ from spotify_scraper import SpotifyScraperThread
 class SpotifyDownGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.settings = QSettings('SpotifyDown', 'GUI')
+        self.settings = QSettings('SpotifyDownloader', 'SpotifyDownloader')
         
         self.spotify_url_input = None
         self.last_spotify_url = None
