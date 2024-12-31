@@ -35,16 +35,18 @@ class SpotifySong:
     cover: str = None
     releaseDate: str = None
     link: str = None
-    #
+    track_number: int = None
+    # state
     downloaded: bool = False
     skipped: bool = False
     failed: bool = False
     error: str = None
+    in_album: bool = False
     
     def __init__(self, data = None):
         self.parse(data)
     
-    def parse(self, data):
+    def parse(self, data, album_cover=None, track_number=None):
         if 'id' in data:
             self.id=data['id']
         if 'title' in data:
@@ -56,10 +58,18 @@ class SpotifySong:
                 self.artist=data["artists"]
         if 'album' in data:
             self.album=data['album']
-        if 'cover' in data:
-            self.cover = data["cover"]
+        if album_cover is not None:
+            self.cover = album_cover
+        else:
+            if 'cover' in data:
+                self.cover = data["cover"]
         if 'releaseDate' in data:
             self.releaseDate = data["releaseDate"]
+        if track_number is not None:
+            self.track_number = track_number
+        else:
+            if 'trackNumber' in data:
+                self.track_number = data["trackNumber"]
         
     @property
     def url(self):
@@ -67,11 +77,20 @@ class SpotifySong:
     
     @property
     def filename(self):
-        return self.clean_filename(f"{self.artist} - {self.album} - {self.title}.mp3")
+        return self.clean_filename(f"{self.name}.mp3")
         
     @property
     def name(self): 
-        return f"{self.artist} - {self.album} - {self.title}"
+        if self.in_album:
+            if self.track_number is not None:
+                if self.track_number<10:
+                    return f"0{self.track_number} - {self.title}"
+                else:
+                    return f"{self.track_number} - {self.title}"
+            else:
+                return self.title
+        else:
+            return f"{self.artist} - {self.album} - {self.title}"
         
     def clean_filename(self, fn):
         validchars = "-_.() '',"
@@ -90,6 +109,7 @@ class SpotifyScraperThread(QThread):
     token_updated = pyqtSignal(str)
     progress_updated = pyqtSignal(str)
     
+    
     def __init__(self, link, token, output_path, debug=False):
         super().__init__()
         self.link = link
@@ -100,6 +120,7 @@ class SpotifyScraperThread(QThread):
     
     def is_album(self, url):
         return "/album/" in url 
+          
           
     def is_playlist(self, url):
         return "/playlist/" in url
@@ -123,11 +144,11 @@ class SpotifyScraperThread(QThread):
     def failed_tracks(self):
         return [track for track in self.tracks if track.failed]
     
+    
     def random_track_id(self):
         return random.choice(self.tracks).id
         
-        
-# Token    
+           
     async def _fetch_token(self):
         self.progress_updated.emit("\tGetting new token")
         try:
@@ -154,52 +175,67 @@ class SpotifyScraperThread(QThread):
                 return resp_json['success']
             except Exception as e:
                 self.progress_updated.emit("error while checking token" + str(e))
-                self.progress_updated.emit(traceback.format_exc())
+                self.progress_updated.emit(str(traceback.format_exc()))
                 return False
-          
-     
+
           
     def run(self):
         try:
-            #reset progress bar
-            self.counts.emit(100, 0, 0, 0)
-            
+            album_cover = None
+            # get item metadata
             if self.is_playlist(self.link) or self.is_album(self.link):
                 entity_id = self.link.split('/')[-1].split('?')[0]
-                entity_metadata_resp = self._call_downloader_api(f"/metadata/playlist/{entity_id}")
-                entity_metadata = entity_metadata_resp.json()
+
                 if self.is_playlist(self.link):
+                    entity_metadata_resp = self._call_downloader_api(f"/metadata/playlist/{entity_id}")
+                    entity_metadata = entity_metadata_resp.json()
                     entity_type = "playlist"
-                    entity_name = entity_metadata['title'] + " (" + entity_metadata['artists'] + ")"
+                    if isinstance(entity_metadata["artists"], (list, tuple)):
+                        artist=', '.join(entity_metadata["artists"])
+                    else:
+                        artist=entity_metadata["artists"]
+                    entity_name = entity_metadata['title'] + " (" + artist + ")"
                 else:
+                    entity_metadata_resp = self._call_downloader_api(f"/metadata/album/{entity_id}")
+                    entity_metadata = entity_metadata_resp.json()
                     entity_type = "album"
-                    entity_name = entity_metadata['artists']+ " - " + entity_metadata['title']
+                    if isinstance(entity_metadata["artists"], (list, tuple)):
+                        artist=', '.join(entity_metadata["artists"])
+                    else:
+                        artist=entity_metadata["artists"]
+                    entity_name = artist + " - " + entity_metadata['title']
+                    if 'cover' in entity_metadata:
+                        album_cover = entity_metadata['cover']
                     
-                self.progress_updated.emit(entity_type + ": " + entity_name + "\n")
-            
+                self.progress_updated.emit(entity_type + ": " + entity_name)
                 if not entity_metadata["success"]:
                     self.progress_updated.emit("not a valid "+ entity_name + ", Spotify api return error message: " + playlist_metadata["message"])
                     return                
 
                 entity_name = entity_name.replace("/", "-")
                 self.output_path = Path(self.output_path + "/" + entity_name)
-            
+                
+                self.progress_updated.emit("Getting tracks metadata")
+                self.get_tracks_to_download(entity_type, entity_id, album_cover=album_cover)
+                self.progress_updated.emit(f"\nDownloading {len(self.tracks)} tracks:")
+                
             elif self.is_track(self.link):
                 self.output_path = Path(self.output_path)
                 self.progress_updated.emit("Single track")
                 entity_type = "track"
                 entity_id = self.link.split('/')[-1].split('?')[0]
+                track_resp = self._call_downloader_api( f"/metadata/track/{entity_id}").json()
+                self.tracks = [SpotifySong(track_resp)]
+                
             else:
                 self.progress_updated.emit("Error: Invalid url")
                 return
         
-        
             if not os.path.exists(self.output_path):
                 os.makedirs(self.output_path)
-       
-            self.get_tracks_to_download(entity_type, entity_id)
             
-            self.download_all_tracks()
+            
+            self.download_all_tracks(entity_type)
             if entity_type == "track":
                 self.track_scrape_report()
             else:
@@ -207,9 +243,153 @@ class SpotifyScraperThread(QThread):
         except Exception as e:
             self.progress_updated.emit("error in scrape" + str(e))
             self.progress_updated.emit(traceback.format_exc())
+    
+    
+    def get_tracks_to_download(self, entity_type: str, entity_id: str, album_cover=None) -> list:
+        if entity_type in ["playlist", "album"]:
+            tracks_resp = self._call_downloader_api(f"/trackList/{entity_type}/{entity_id}").json()
+            track_number = 1
+            if tracks_resp.get('trackList'):
+                self.tracks = []
+                for track_resp in tracks_resp['trackList']:
+                    self.add_track(track_resp, album_cover, track_number, entity_type)
+                    track_number += 1
+
+                while next_offset := tracks_resp.get('nextOffset'):
+                    tracks_resp = self._call_downloader_api(f"/trackList/{entity_type}/{entity_id}?offset={next_offset}").json()
+                    for data in tracks_resp['trackList']:
+                        self.add_track(track_resp, album_cover, track_number, entity_type)
+                        track_number += 1
+                            
+    def add_track(self, track_resp, album_cover, track_number, entity_type):
+        track = SpotifySong(track_resp)
+        if entity_type=="playlist":
+            track.track_number = track_number
+        if album_cover is not None:
+            track.cover = album_cover
+        if entity_type == "album":
+            track.in_album = True
+        self.tracks.append(track)
             
-             
         
+    
+    def download_all_tracks(self, entity_type:str):
+        for track in self.tracks:
+            full_filename = self.output_path / track.filename
+            try:
+                if os.path.exists(full_filename) and os.path.getsize(full_filename) != 0:
+                    track.skipped=True
+                    self.progress_updated.emit(f"file exists, skipping: {track.name}")
+                else:
+                    self.progress_updated.emit(f"{track.name}")
+                    retries = 0
+                    max_retries = 3
+                    while not track.downloaded:
+                        try:
+                            self.get_token()
+                            self.get_track_link(track)
+                            self.download_track(track, entity_type)
+                            track.downloaded=True
+                            track.failed=False
+                            self.progress_updated.emit('\tdone')
+                        except Exception as exc:
+                            self.progress_updated.emit(f"\terror while processing track: {str(exc)}")
+                            if self.debug:
+                                self.progress_updated.emit(traceback.format_exc())
+                            retries += 1
+                            self.progress_updated.emit(f'\tretrying... attempt {retries} of {max_retries}')
+                            sleep(retries)
+                            if retries>max_retries:
+                                raise exc
+            except Exception as exc:
+                self.progress_updated.emit(f"\terror while processing track: {str(exc)}")
+                track.failed=True
+                if self.debug:
+                    self.progress_updated.emit(str(traceback.format_exc()))
+                 
+            self.counts.emit(self.track_count(), self.downloaded_track_count(), self.skipped_track_count(), self.failed_track_count())
+    
+    
+    def get_track_link(self, track):
+        self.progress_updated.emit(f"\tget track link")
+        resp = self._call_downloader_api(f"/download/{track.id}?token={self.token}")    
+        resp_json = resp.json() 
+        if not resp_json['success']:
+            self.progress_updated.emit("Could not get track link for "+track.name)
+            self.progress_updated.emit(resp_json)
+            track.failed = True
+            if resp_json["statusCode"]==403:
+                self.token_error.emit()
+                track.error = resp_json["message"]
+            else:
+                track.error = resp_json["message"]
+        else:
+            track.link = resp_json["link"]
+    
+        
+    def download_track(self, track:SpotifySong, entity_type:str):
+        self.progress_updated.emit(f"\tdownload audio")
+        # Clean browser heads for API
+        hdrs = {
+            #'Host': 'cdn[#].tik.live', # <-- set this below
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip',
+            'Referer': 'https://spotifydown.com/',
+            'Origin': 'https://spotifydown.com',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Sec-GPC': '1'
+        }
+
+        if track.link is None:
+            raise RuntimeError(f"no link for '{track.name}")
+
+        # For audio
+        hdrs['Host'] = track.link.split('/')[2]
+        audio_dl_resp = requests.get(track.link, headers=hdrs)
+        
+        if not audio_dl_resp.ok:
+            error = f"Bad download response for track '{track.title}' ({track.id}): {audio_dl_resp.status_code}: {audio_dl_resp.content}"
+            raise RuntimeError(error)
+        
+        self.progress_updated.emit(f"\tsave file")
+        filename = self.output_path/f"{track.filename}"
+        
+        with open(filename, 'wb') as track_mp3_fp:
+            track_mp3_fp.write(audio_dl_resp.content)
+
+        if not os.path.exists(filename):
+              raise Exception("download failed")          
+        if os.path.getsize(filename) == 0:
+              raise Exception("downloaded file is zero byte.")
+              os.remove(filename) 
+                
+
+        self.progress_updated.emit(f"\tadding tags")
+        #tags
+        mp3_file = eyed3.load(filename)
+        if (mp3_file.tag == None):
+            mp3_file.initTag()
+        mp3_file.tag.album = track.album
+        mp3_file.tag.artist = track.artist
+        mp3_file.tag.title = track.title
+        mp3_file.tag.recording_date = track.releaseDate
+        mp3_file.tag.track_num = track.track_number
+          
+        # cover art
+        if cover_art_url := track.cover:
+            hdrs['Host'] = cover_art_url.split('/')[2]
+            cover_resp = requests.get(cover_art_url,headers=hdrs)
+            mp3_file.tag.images.set(ImageFrame.FRONT_COVER, cover_resp.content, 'image/jpeg')
+        #save tags
+        mp3_file.tag.save(version=ID3_V2_3)
+        
+    
     def playlist_scrape_report(self):
         details = ""   
                  
@@ -238,15 +418,16 @@ class SpotifyScraperThread(QThread):
         for track in self.tracks:
             if track.filename not in directory_files:
                  in_playlist_not_in_folder.append(track.name)
-        if len(in_playlist_not_in_folder):
+        if len(in_playlist_not_in_folder)>0:
             details += "\nTracks in playlist but not in folder:"
             for track in in_playlist_not_in_folder:
                 details += "\n" + track
             details += "\n"
         
-        if len(in_playlist_not_in_folder)==0 and len(in_folder_not_in_playlist)==0 and self.failed_track_count==0:
+        if len(in_playlist_not_in_folder)==0 and len(in_folder_not_in_playlist)==0 and self.failed_track_count()==0:
             details += "All downloads completed sucessfully!"
-            
+        
+        self.progress_updated.emit("")
         self.progress_updated.emit(details)
         
     
@@ -288,139 +469,6 @@ class SpotifyScraperThread(QThread):
         except Exception as exc:
             raise RuntimeError("ERROR: ", exc)
         return resp
-        
-
-
-    def get_tracks_to_download(self, entity_type: str, entity_id: str) -> list:
-        if entity_type == "track":
-            track_resp = self._call_downloader_api( f"/metadata/track/{entity_id}").json()
-            self.tracks.append(SpotifySong(track_resp))
-
-        elif entity_type in ["playlist", "album"]:
-            tracks_resp = self._call_downloader_api(f"/trackList/{entity_type}/{entity_id}").json()
-            if tracks_resp.get('trackList'):
-                self.tracks = []
-                for track_resp in tracks_resp['trackList']:
-                    self.tracks.append(SpotifySong(track_resp))
-       
-                while next_offset := tracks_resp.get('nextOffset'):
-                    tracks_resp = self._call_downloader_api(f"/trackList/{entity_type}/{entity_id}?offset={next_offset}").json()
-                    for data in tracks_resp['trackList']:
-                        self.tracks.append(SpotifySong(track_resp))
-
-    def get_track_link(self, track):
-        self.progress_updated.emit(f"\tget track link")
-        resp = self._call_downloader_api(f"/download/{track.id}?token={self.token}")    
-        resp_json = resp.json() 
-        if not resp_json['success']:
-            self.progress_updated.emit("Could not get track link for "+track.name)
-            self.progress_updated.emit(resp_json)
-            track.failed = True
-            if resp_json["statusCode"]==403:
-                self.token_error.emit()
-                track.error = resp_json["message"]
-            else:
-                track.error = resp_json["message"]
-        else:
-            track.link = resp_json["link"]
-    
-        
-
-    def download_track(self, track:SpotifySong):
-        self.progress_updated.emit(f"\tdownload audio")
-        # Clean browser heads for API
-        hdrs = {
-            #'Host': 'cdn[#].tik.live', # <-- set this below
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip',
-            'Referer': 'https://spotifydown.com/',
-            'Origin': 'https://spotifydown.com',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site',
-            'Sec-GPC': '1'
-        }
-
-        if track.link is None:
-            raise RuntimeError(f"no link for '{track.name}")
-
-        # For audio
-        hdrs['Host'] = track.link.split('/')[2]
-        audio_dl_resp = requests.get(track.link, headers=hdrs)
-        
-        if not audio_dl_resp.ok:
-            error = f"Bad download response for track '{track.title}' ({track.id}): {audio_dl_resp.status_code}: {audio_dl_resp.content}"
-            raise RuntimeError(error)
-        
-        self.progress_updated.emit(f"\tsave file")
-        with open(self.output_path/track.filename, 'wb') as track_mp3_fp:
-            track_mp3_fp.write(audio_dl_resp.content)
-            
-        if not os.path.exists(self.output_path/track.filename) or os.path.getsize(self.output_path/track.filename) == 0:
-              raise Exception("downloaded file is zero byte.")  
-                
-
-        self.progress_updated.emit(f"\tadding tags")
-        #tags
-        mp3_file = eyed3.load(self.output_path/track.filename)
-        if (mp3_file.tag == None):
-            mp3_file.initTag()
-        mp3_file.tag.album = track.album
-        mp3_file.tag.artist = track.artist
-        mp3_file.tag.title = track.title
-        mp3_file.tag.recording_date = track.releaseDate
-          
-        # cover art
-        if cover_art_url := track.cover:
-            hdrs['Host'] = cover_art_url.split('/')[2]
-            cover_resp = requests.get(cover_art_url,headers=hdrs)
-            mp3_file.tag.images.set(ImageFrame.FRONT_COVER, cover_resp.content, 'image/jpeg')
-        #save tags
-        mp3_file.tag.save(version=ID3_V2_3) 
-
-
-    def download_all_tracks(self):
-       
-        for track in self.tracks:
-            
-            full_filename = self.output_path / track.filename
-            try:
-                if os.path.exists(full_filename) and os.path.getsize(full_filename) != 0:
-                    track.skipped=True
-                    self.progress_updated.emit(f"file exists, skipping: {track.name}")
-                else:
-                    self.progress_updated.emit(f"{track.name}")
-                    retries = 0
-                    max_retries = 3
-                    while not track.downloaded:
-                        try:
-                            self.get_token()
-                            self.get_track_link(track)
-                            self.download_track(track)
-                            track.downloaded=True
-                            track.failed=False
-                            self.progress_updated.emit('\tdone')
-                        except Exception as exc:
-                            self.progress_updated.emit("\terror while processing track: "+ str(exc))
-                            if self.debug:
-                                self.progress_updated.emit(traceback.format_exc())
-                            retries += 1
-                            self.progress_updated.emit('\tretrying... attempt {retries} of {max_retries}')
-                            sleep(retries*0.5)
-                            if errors>max_retries:
-                                raise exc
-            except Exception as exc:
-                self.progress_updated.emit("\terror while processing track: "+ str(exc))
-                track.failed=True
-                if self.debug:
-                    self.progress_updated.emit(traceback.format_exc())
-                
-                
-            self.counts.emit(self.track_count(), self.downloaded_track_count(), self.skipped_track_count(), self.failed_track_count())
 
 
 
