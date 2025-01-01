@@ -110,13 +110,14 @@ class SpotifyScraperThread(QThread):
     progress_updated = pyqtSignal(str)
     
     
-    def __init__(self, link, token, output_path, debug=False):
+    def __init__(self, link, token, output_path):
         super().__init__()
         self.link = link
         self.tracks = []
         self.token = token
         self.output_path = output_path
-        self.debug = debug
+        # enable debug is debug is present in url
+        self.debug = "debug" in link
     
     def is_album(self, url):
         return "/album/" in url 
@@ -161,7 +162,7 @@ class SpotifyScraperThread(QThread):
         except Exception as e:
             self.progress_updated.emit(f"\tFailed to fetch token: {str(e)}")
 
-    def get_token(self):
+    def get_token_if_needed(self):
         if not self.token_is_valid():
             asyncio.run(self._fetch_token())
         
@@ -234,15 +235,16 @@ class SpotifyScraperThread(QThread):
             if not os.path.exists(self.output_path):
                 os.makedirs(self.output_path)
             
-            
             self.download_all_tracks(entity_type)
             if entity_type == "track":
                 self.track_scrape_report()
             else:
                 self.playlist_scrape_report()
+                
         except Exception as e:
-            self.progress_updated.emit("error in scrape" + str(e))
-            self.progress_updated.emit(traceback.format_exc())
+            self.progress_updated.emit("Error while downloading" + str(e))
+            if self.debug:
+                self.progress_updated.emit(str(traceback.format_exc()))
     
     
     def get_tracks_to_download(self, entity_type: str, entity_id: str, album_cover=None) -> list:
@@ -270,7 +272,6 @@ class SpotifyScraperThread(QThread):
         if entity_type == "album":
             track.in_album = True
         self.tracks.append(track)
-            
         
     
     def download_all_tracks(self, entity_type:str):
@@ -286,16 +287,14 @@ class SpotifyScraperThread(QThread):
                     max_retries = 3
                     while not track.downloaded:
                         try:
-                            self.get_token()
+                            self.get_token_if_needed()
                             self.get_track_link(track)
                             self.download_track(track, entity_type)
-                            track.downloaded=True
-                            track.failed=False
                             self.progress_updated.emit('\tdone')
                         except Exception as exc:
                             self.progress_updated.emit(f"\terror while processing track: {str(exc)}")
                             if self.debug:
-                                self.progress_updated.emit(traceback.format_exc())
+                                self.progress_updated.emit(str(traceback.format_exc()))
                             retries += 1
                             self.progress_updated.emit(f'\tretrying... attempt {retries} of {max_retries}')
                             sleep(retries)
@@ -329,7 +328,11 @@ class SpotifyScraperThread(QThread):
         
     def download_track(self, track:SpotifySong, entity_type:str):
         self.progress_updated.emit(f"\tdownload audio")
-        # Clean browser heads for API
+        if track.link is None:
+            raise RuntimeError(f"no download link for '{track.name}")
+        
+        filename = self.output_path/f"{track.filename}"
+
         hdrs = {
             #'Host': 'cdn[#].tik.live', # <-- set this below
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
@@ -345,33 +348,24 @@ class SpotifyScraperThread(QThread):
             'Sec-Fetch-Site': 'cross-site',
             'Sec-GPC': '1'
         }
-
-        if track.link is None:
-            raise RuntimeError(f"no link for '{track.name}")
-
-        # For audio
         hdrs['Host'] = track.link.split('/')[2]
         audio_dl_resp = requests.get(track.link, headers=hdrs)
-        
         if not audio_dl_resp.ok:
             error = f"Bad download response for track '{track.title}' ({track.id}): {audio_dl_resp.status_code}: {audio_dl_resp.content}"
             raise RuntimeError(error)
         
-        self.progress_updated.emit(f"\tsave file")
-        filename = self.output_path/f"{track.filename}"
-        
+        self.progress_updated.emit(f"\tsaving file")
         with open(filename, 'wb') as track_mp3_fp:
             track_mp3_fp.write(audio_dl_resp.content)
 
         if not os.path.exists(filename):
               raise Exception("download failed")          
         if os.path.getsize(filename) == 0:
-              raise Exception("downloaded file is zero byte.")
+              raise Exception("downloaded failed. File is zero byte.")
               os.remove(filename) 
-                
-
+        
+        # tags
         self.progress_updated.emit(f"\tadding tags")
-        #tags
         mp3_file = eyed3.load(filename)
         if (mp3_file.tag == None):
             mp3_file.initTag()
@@ -386,13 +380,18 @@ class SpotifyScraperThread(QThread):
             hdrs['Host'] = cover_art_url.split('/')[2]
             cover_resp = requests.get(cover_art_url,headers=hdrs)
             mp3_file.tag.images.set(ImageFrame.FRONT_COVER, cover_resp.content, 'image/jpeg')
-        #save tags
+        # save tags
         mp3_file.tag.save(version=ID3_V2_3)
+        
+        # update track state
+        track.downloaded=True
+        track.failed=False
         
     
     def playlist_scrape_report(self):
         details = ""   
-                 
+        
+        # failed tracks    
         if self.failed_track_count()>0:
             details += "\nFailed track downloads:"
             for track in self.failed_tracks():
@@ -404,7 +403,8 @@ class SpotifyScraperThread(QThread):
         playlist_filenames = []
         for track in self.tracks:
             playlist_filenames.append(track.filename)
-            
+        
+        # extraneous tracks
         for filename in directory_files:
             if filename not in playlist_filenames and filename != ".DS_Store" and not filename.startswith(".syncthing.") and not filename.endswith(".stem.m4a"):
                 in_folder_not_in_playlist.append(filename)
@@ -413,7 +413,8 @@ class SpotifyScraperThread(QThread):
             for track in in_folder_not_in_playlist:
                 details += "\n" + track
             details += "\n"
-                
+        
+        # missing tracks
         in_playlist_not_in_folder = []
         for track in self.tracks:
             if track.filename not in directory_files:
@@ -438,10 +439,9 @@ class SpotifyScraperThread(QThread):
             for track in self.failed_tracks():
                 details += "\n" + track
             details += "\n"
-        
-        if self.failed_track_count==0:
+        else:
             details += "Download completed sucessfully!"
-            
+        
         self.progress_updated.emit(details)
     
 
